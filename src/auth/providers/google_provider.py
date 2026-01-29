@@ -47,21 +47,19 @@ class GoogleProvider(OAuthProvider):
         if token is not None and token.is_valid:
             if not token.is_stale:
                 return token
-            if token.can_refresh:
+        
+        # refresh if we can, otherwise fallback on re-auth
+        try:
+            if token is not None and token.can_refresh:
                 token.refresh()
                 with open(GOOGLE_LOCAL_TOKEN_PATH, 'w') as new_token:
                     new_token.write(token.creds.to_json())
             
                 return token
-        
-        # refresh if we can
-        if token is not None and token.can_refresh:
-            token.refresh()
-            with open(GOOGLE_LOCAL_TOKEN_PATH, 'w') as new_token:
-                new_token.write(token.creds.to_json())
-        
-            return token
-        
+        except:
+            # log that refresh failed (invalid refresh token)
+            pass
+
         return None
 
     def generate_auth_url(
