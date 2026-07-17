@@ -22,7 +22,7 @@ SERVER_ORIGIN_PROXY = os.getenv('SERVER_ORIGIN_PROXY')
 SALESFORCE_AUTH_MESSAGE = "Authorization is required to access your Salesforce org."
 OUTREACH_AUTH_MESSAGE = "Authorization is required to access your Outreach workspace."
 
-mcp = FastMCP(name="Assistant-MCP", host=SERVER_HOST, port=SERVER_PORT)
+mcp = FastMCP(name="crm-sep-sandbox-mcp", host=SERVER_HOST, port=SERVER_PORT)
 salesforce_tools = SalesforceToolApp(provider=get_provider('salesforce'))
 outreach_tools = OutreachToolApp(provider=get_provider('outreach'))
 

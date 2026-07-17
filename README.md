@@ -1,4 +1,4 @@
-# Assistant-MCP
+# oauth-mcp
 
 An MCP (Model Context Protocol) server that provides OAuth 2.0-protected tools to agentic clients. Built with FastMCP and currently integrates with Salesforce (CRM) and Outreach (SEP).
 
@@ -49,7 +49,7 @@ Architecture based on my original framework [here](https://frankwl.com/projects/
 ## Project Structure
 
 ```
-assistant-mcp/
+oauth-mcp/
 ├── .env                       # Environment configuration (see .env.example)
 ├── .python-version            # Python 3.13
 ├── pyproject.toml             # Dependencies and metadata
@@ -98,7 +98,7 @@ refresh themselves.
 
 ```bash
 git clone <repo-url>
-cd assistant-mcp
+cd oauth-mcp
 uv sync
 ```
 
@@ -193,14 +193,19 @@ character for character — `localhost` vs `127.0.0.1` counts as a mismatch
 ### 6. Run and authenticate
 
 ```bash
-uv run python src/main.py
+uv run crm-sep-sandbox-mcp
+# equivalent: uv run python src/main.py
 ```
+
+(The `crm-sep-sandbox-mcp` entry point snapshots `src/main.py` at install time — after
+editing that file, run `uv sync --reinstall-package oauth-mcp`, or launch via
+`uv run python src/main.py` while iterating.)
 
 The server runs at `http://{SERVER_HOST}:{SERVER_PORT}/mcp` (streamable HTTP transport).
 Point an MCP client at it, e.g.:
 
 ```bash
-claude mcp add --transport http sf-outreach http://localhost:3999/mcp
+claude mcp add --transport http crm-sep-sandbox-mcp http://localhost:3999/mcp
 ```
 
 Then, with the ngrok tunnel running, call any provider tool (or run
