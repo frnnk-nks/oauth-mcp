@@ -2,7 +2,9 @@
 
 An MCP (Model Context Protocol) server that provides OAuth 2.0-protected tools to agentic clients. Built with FastMCP and currently integrates with Salesforce (CRM) and Outreach (SEP).
 
-Intended use: creating and modifying prospects, sequences, sequence tasks, and related fixtures directly from an agent, so software changes can be tested against sandbox-style Salesforce orgs and Outreach workspaces without brittle one-off scripting — with a single, consolidated authentication experience.
+Intended use: creating and modifying prospects, sequences, sequence tasks, and related fixtures directly from an agent, so software changes can be tested against sandbox-style Salesforce orgs and Outreach workspaces without brittle one-off scripting: with a single, consolidated authentication experience.
+
+Architecture based on my original framework [here](https://frankwl.com/projects/mcp-server-framework).
 
 ## Components
 
