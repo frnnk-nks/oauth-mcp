@@ -11,6 +11,7 @@ Makes use of the Outreach OAuth token, found in auth.tokens.outreach_token
 """
 
 import os
+import time
 from typing import Any, Dict, List, Optional
 import httpx
 from dotenv import load_dotenv
@@ -26,7 +27,9 @@ SCOPES = [
     "sequences.all",
     "sequenceSteps.all",
     "sequenceStates.all",
+    "sequenceTemplates.all",
     "tasks.all",
+    "templates.all",
     "mailboxes.read",
     "users.read"
 ]
@@ -35,6 +38,8 @@ JSON_API_CONTENT_TYPE = 'application/vnd.api+json'
 ERROR_TEXT_CAP = 2000
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_PAGE_LIMIT = 100
+MAX_BATCH_ITEMS = 100
+BATCH_PACING_SECONDS = 0.15
 
 SHARE_TYPES = {'private', 'read_only', 'shared'}
 STEP_TYPES = {'auto_email', 'manual_email', 'call', 'task'}
@@ -43,6 +48,8 @@ ACCOUNT_SUMMARY = ['name', 'domain', 'websiteUrl', 'createdAt']
 PROSPECT_SUMMARY = ['firstName', 'lastName', 'emails', 'title', 'company', 'tags', 'createdAt', 'updatedAt']
 SEQUENCE_SUMMARY = ['name', 'description', 'shareType', 'enabled', 'sequenceStepCount', 'createdAt']
 SEQUENCE_STEP_SUMMARY = ['stepType', 'order', 'interval', 'taskNote', 'createdAt']
+TEMPLATE_SUMMARY = ['name', 'subject', 'shareType', 'trackLinks', 'trackOpens', 'createdAt']
+SEQUENCE_TEMPLATE_SUMMARY = ['isReply', 'enabled', 'createdAt']
 SEQUENCE_STATE_SUMMARY = ['state', 'createdAt']
 TASK_SUMMARY = ['action', 'note', 'dueAt', 'state', 'createdAt']
 MAILBOX_SUMMARY = ['email', 'sendDisabled', 'syncActiveState']
@@ -68,6 +75,61 @@ def _relationship(resource_type: str, resource_id: Any) -> Dict[str, Any]:
 
 def _compact(attributes: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in attributes.items() if value is not None}
+
+
+def _validate_batch(items: List[Any], label: str):
+    if not items:
+        raise ApiRequestError(f"{label} list is empty")
+    if len(items) > MAX_BATCH_ITEMS:
+        raise ApiRequestError(
+            f"batch too large: {len(items)} {label} > {MAX_BATCH_ITEMS}; split across multiple calls"
+        )
+
+
+def _prospect_payload(
+    emails: List[str],
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    title: Optional[str] = None,
+    company: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    account_id: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    extra_attributes: Optional[Dict[str, Any]] = None
+):
+    if not emails:
+        raise ApiRequestError("emails is required for a prospect")
+    attributes = {
+        'emails': emails,
+        'firstName': first_name,
+        'lastName': last_name,
+        'title': title,
+        'company': company,
+        'tags': tags,
+        **(extra_attributes or {})
+    }
+    relationships = {}
+    if account_id is not None:
+        relationships['account'] = _relationship('account', account_id)
+    if owner_id is not None:
+        relationships['owner'] = _relationship('user', owner_id)
+    return attributes, relationships
+
+
+def _task_payload(
+    prospect_id: str,
+    action: str = 'action_item',
+    note: Optional[str] = None,
+    due_at: Optional[str] = None,
+    owner_id: Optional[str] = None
+):
+    attributes = {'action': action, 'note': note, 'dueAt': due_at}
+    # tasks link to prospects via the polymorphic 'subject' relationship;
+    # writing 'prospect' directly is rejected as a private relationship
+    relationships = {'subject': _relationship('prospect', prospect_id)}
+    if owner_id is not None:
+        relationships['owner'] = _relationship('user', owner_id)
+    return attributes, relationships
 
 
 class OutreachToolApp(OAuthToolApp):
@@ -216,22 +278,54 @@ class OutreachToolApp(OAuthToolApp):
         owner_id: Optional[str] = None,
         extra_attributes: Optional[Dict[str, Any]] = None
     ):
-        attributes = {
-            'emails': emails,
-            'firstName': first_name,
-            'lastName': last_name,
-            'title': title,
-            'company': company,
-            'tags': tags,
-            **(extra_attributes or {})
-        }
-        relationships = {}
-        if account_id is not None:
-            relationships['account'] = _relationship('account', account_id)
-        if owner_id is not None:
-            relationships['owner'] = _relationship('user', owner_id)
-
+        attributes, relationships = _prospect_payload(
+            emails=emails, first_name=first_name, last_name=last_name, title=title,
+            company=company, tags=tags, account_id=account_id, owner_id=owner_id,
+            extra_attributes=extra_attributes
+        )
         return self._create(token, '/prospects', 'prospect', attributes, relationships, PROSPECT_SUMMARY)
+
+    @tool_scope_factory(scopes=SCOPES)
+    def create_prospects(
+        self, *,
+        token: OutreachToken,
+        ctx: Dict[str, Any],
+        prospects: List[Dict[str, Any]]
+    ):
+        """
+        Serial batch create (Outreach has no bulk endpoint). Failures don't stop the
+        batch; each is reported with its index. No whole-method retry — a retry after
+        partial success would duplicate records.
+        """
+        _validate_batch(prospects, 'prospects')
+        created, failed = [], []
+        for index, item in enumerate(prospects):
+            if index:
+                time.sleep(BATCH_PACING_SECONDS)
+            try:
+                attributes, relationships = _prospect_payload(
+                    emails=item.get('emails'),
+                    first_name=item.get('first_name'),
+                    last_name=item.get('last_name'),
+                    title=item.get('title'),
+                    company=item.get('company'),
+                    tags=item.get('tags'),
+                    account_id=item.get('account_id'),
+                    owner_id=item.get('owner_id'),
+                    extra_attributes=item.get('extra_attributes')
+                )
+                record = self._create(token, '/prospects', 'prospect', attributes, relationships, PROSPECT_SUMMARY)
+                created.append({'index': index, **record})
+            except (ApiRequestError, RetryableApiError) as e:
+                failed.append({'index': index, 'error': str(e)[:500]})
+
+        return {
+            'requested': len(prospects),
+            'created_count': len(created),
+            'failed_count': len(failed),
+            'created': created,
+            'failed': failed
+        }
 
     @tool_scope_factory(scopes=SCOPES)
     @tool_retry_factory(error_message="Outreach error (update_prospect)", retry_on=(RetryableApiError,))
@@ -321,7 +415,7 @@ class OutreachToolApp(OAuthToolApp):
         sequence_id: str,
         step_type: str,
         order: Optional[int] = None,
-        interval_minutes: Optional[int] = None,
+        interval_seconds: Optional[int] = None,
         task_note: Optional[str] = None
     ):
         if step_type not in STEP_TYPES:
@@ -330,7 +424,7 @@ class OutreachToolApp(OAuthToolApp):
         attributes = {
             'stepType': step_type,
             'order': order,
-            'interval': interval_minutes,
+            'interval': interval_seconds,
             'taskNote': task_note
         }
         relationships = {'sequence': _relationship('sequence', sequence_id)}
@@ -359,6 +453,134 @@ class OutreachToolApp(OAuthToolApp):
             token, '/sequenceStates', 'sequenceState', {}, relationships, SEQUENCE_STATE_SUMMARY
         )
 
+    @tool_scope_factory(scopes=SCOPES)
+    def enroll_prospects(
+        self, *,
+        token: OutreachToken,
+        ctx: Dict[str, Any],
+        sequence_id: str,
+        prospect_ids: List[str],
+        mailbox_id: str
+    ):
+        """
+        Serial batch enrollment into one sequence. Outreach requires a mailbox on every
+        sequenceState, so it's a required argument here.
+        """
+        _validate_batch(prospect_ids, 'prospect_ids')
+        sequence_rel = _relationship('sequence', sequence_id)
+        mailbox_rel = _relationship('mailbox', mailbox_id)
+        created, failed = [], []
+        for index, prospect_id in enumerate(prospect_ids):
+            if index:
+                time.sleep(BATCH_PACING_SECONDS)
+            try:
+                relationships = {
+                    'sequence': sequence_rel,
+                    'prospect': _relationship('prospect', prospect_id),
+                    'mailbox': mailbox_rel
+                }
+                record = self._create(
+                    token, '/sequenceStates', 'sequenceState', {}, relationships, SEQUENCE_STATE_SUMMARY
+                )
+                created.append({'index': index, 'prospect_id': prospect_id, **record})
+            except (ApiRequestError, RetryableApiError) as e:
+                failed.append({'index': index, 'prospect_id': prospect_id, 'error': str(e)[:500]})
+
+        return {
+            'requested': len(prospect_ids),
+            'created_count': len(created),
+            'failed_count': len(failed),
+            'created': created,
+            'failed': failed
+        }
+
+    @tool_scope_factory(scopes=SCOPES)
+    @tool_retry_factory(error_message="Outreach error (activate_sequence)", retry_on=(RetryableApiError,))
+    def activate_sequence(self, *, token: OutreachToken, ctx: Dict[str, Any], sequence_id: str):
+        """
+        Enable a sequence via the actions sub-endpoint. PATCHing 'enabled' is rejected
+        ("private attribute"); POST /sequences/{id}/actions/activate is the supported
+        path (mirrors the Nooks apiWrappers/outreach activateSequence).
+        """
+        sequence_id = _normalize_id(sequence_id, 'sequence id')
+        self._request(token, 'POST', f"/sequences/{sequence_id}/actions/activate")
+        result = self._request(token, 'GET', f"/sequences/{sequence_id}")
+        return self._slim(result['data'], SEQUENCE_SUMMARY)
+
+    @tool_scope_factory(scopes=SCOPES)
+    @tool_retry_factory(error_message="Outreach error (create_template)", retry_on=(RetryableApiError,))
+    def create_template(
+        self, *,
+        token: OutreachToken,
+        ctx: Dict[str, Any],
+        name: str,
+        subject: str,
+        body_html: str,
+        share_type: str = 'shared',
+        tags: Optional[List[str]] = None,
+        track_links: bool = True,
+        track_opens: bool = True,
+        owner_id: Optional[str] = None
+    ):
+        if share_type not in SHARE_TYPES:
+            raise ApiRequestError(f"share_type must be one of {sorted(SHARE_TYPES)}")
+
+        attributes = {
+            'name': name,
+            'subject': subject,
+            'bodyHtml': body_html,
+            'shareType': share_type,
+            'tags': tags,
+            'trackLinks': track_links,
+            'trackOpens': track_opens
+        }
+        relationships = {}
+        if owner_id is not None:
+            relationships['owner'] = _relationship('user', owner_id)
+
+        return self._create(token, '/templates', 'template', attributes, relationships, TEMPLATE_SUMMARY)
+
+    @tool_scope_factory(scopes=SCOPES)
+    @tool_retry_factory(error_message="Outreach error (link_template_to_step)", retry_on=(RetryableApiError,))
+    def link_template_to_step(
+        self, *,
+        token: OutreachToken,
+        ctx: Dict[str, Any],
+        sequence_step_id: str,
+        template_id: str,
+        is_reply: bool = False,
+        activate: bool = True
+    ):
+        relationships = {
+            'sequenceStep': _relationship('sequenceStep', sequence_step_id),
+            'template': _relationship('template', template_id)
+        }
+        record = self._create(
+            token, '/sequenceTemplates', 'sequenceTemplate',
+            {'isReply': is_reply}, relationships, SEQUENCE_TEMPLATE_SUMMARY
+        )
+        if activate:
+            self._request(token, 'POST', f"/sequenceTemplates/{record['id']}/actions/activate")
+            record['activated'] = True
+        return record
+
+    @tool_scope_factory(scopes=SCOPES)
+    @tool_retry_factory(error_message="Outreach error (update_sequence)", retry_on=(RetryableApiError,))
+    def update_sequence(
+        self, *,
+        token: OutreachToken,
+        ctx: Dict[str, Any],
+        sequence_id: str,
+        attributes: Dict[str, Any]
+    ):
+        sequence_id = _normalize_id(sequence_id, 'sequence id')
+        if not attributes:
+            raise ApiRequestError("update_sequence requires at least one attribute")
+
+        data = {'type': 'sequence', 'id': sequence_id, 'attributes': attributes}
+        result = self._request(token, 'PATCH', f"/sequences/{sequence_id}", json_body={'data': data})
+        return self._slim(result['data'], SEQUENCE_SUMMARY)
+
     # --- tasks ---
 
     @tool_scope_factory(scopes=SCOPES)
@@ -373,14 +595,48 @@ class OutreachToolApp(OAuthToolApp):
         due_at: Optional[str] = None,
         owner_id: Optional[str] = None
     ):
-        attributes = {'action': action, 'note': note, 'dueAt': due_at}
-        # tasks link to prospects via the polymorphic 'subject' relationship;
-        # writing 'prospect' directly is rejected as a private relationship
-        relationships = {'subject': _relationship('prospect', prospect_id)}
-        if owner_id is not None:
-            relationships['owner'] = _relationship('user', owner_id)
-
+        attributes, relationships = _task_payload(
+            prospect_id=prospect_id, action=action, note=note, due_at=due_at, owner_id=owner_id
+        )
         return self._create(token, '/tasks', 'task', attributes, relationships, TASK_SUMMARY)
+
+    @tool_scope_factory(scopes=SCOPES)
+    def create_tasks(
+        self, *,
+        token: OutreachToken,
+        ctx: Dict[str, Any],
+        tasks: List[Dict[str, Any]],
+        default_owner_id: Optional[str] = None
+    ):
+        """
+        Serial batch create of one-off tasks. Outreach requires an owner on every task;
+        default_owner_id fills in for items that don't set their own.
+        """
+        _validate_batch(tasks, 'tasks')
+        created, failed = [], []
+        for index, item in enumerate(tasks):
+            if index:
+                time.sleep(BATCH_PACING_SECONDS)
+            try:
+                attributes, relationships = _task_payload(
+                    prospect_id=item.get('prospect_id'),
+                    action=item.get('action', 'action_item'),
+                    note=item.get('note'),
+                    due_at=item.get('due_at'),
+                    owner_id=item.get('owner_id', default_owner_id)
+                )
+                record = self._create(token, '/tasks', 'task', attributes, relationships, TASK_SUMMARY)
+                created.append({'index': index, **record})
+            except (ApiRequestError, RetryableApiError) as e:
+                failed.append({'index': index, 'error': str(e)[:500]})
+
+        return {
+            'requested': len(tasks),
+            'created_count': len(created),
+            'failed_count': len(failed),
+            'created': created,
+            'failed': failed
+        }
 
     # --- lookups ---
 

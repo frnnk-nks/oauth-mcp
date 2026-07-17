@@ -159,7 +159,8 @@ if you can't create apps, ask an admin):
 2. **Redirect URI**: `https://<your-domain>.ngrok-free.dev/auth/callback` (https mandatory).
 3. Enable exactly the scopes the server requests (see `SCOPES` in
    `src/mcp_tools/outreach/outreach.py`): `accounts.all`, `prospects.all`, `sequences.all`,
-   `sequenceSteps.all`, `sequenceStates.all`, `tasks.all`, `mailboxes.read`, `users.read`.
+   `sequenceSteps.all`, `sequenceStates.all`, `sequenceTemplates.all`, `tasks.all`,
+   `templates.all`, `mailboxes.read`, `users.read`.
    A missing scope fails the authorize request before any consent screen appears.
 4. Copy the application ID → `OUTREACH_CLIENT_ID` and secret → `OUTREACH_CLIENT_SECRET`.
 
@@ -236,6 +237,7 @@ Troubleshooting:
 | `salesforce_create_contact` | `last_name`, `first_name?`, `email?`, `account_id?`, `title?`, `phone?`, `extra_fields?` | Create account-linked prospect |
 | `salesforce_create_lead` | `last_name`, `company`, `first_name?`, `email?`, `title?`, `phone?`, `extra_fields?` | Create standalone prospect |
 | `salesforce_update_record` | `sobject`, `record_id`, `fields` | Modify any record's fields |
+| `salesforce_create_records` | `records`, `all_or_none?` | Bulk create up to 1000 mixed records (composite API, 200/request) |
 
 ### Outreach Tools
 
@@ -244,14 +246,21 @@ Troubleshooting:
 | `outreach_find_prospects` | `emails?`, `prospect_ids?`, `account_id?`, `limit` | Look up prospects |
 | `outreach_get_prospect` | `prospect_id` | Fetch one prospect |
 | `outreach_create_prospect` | `emails`, `first_name?`, `last_name?`, `title?`, `company?`, `tags?`, `account_id?`, `owner_id?`, `extra_attributes?` | Create prospect |
+| `outreach_create_prospects` | `prospects` | Batch create up to 100 prospects (serial; per-index failures) |
 | `outreach_update_prospect` | `prospect_id`, `attributes?`, `account_id?`, `owner_id?` | Modify prospect data |
 | `outreach_create_account` | `name`, `domain?`, `website_url?`, `extra_attributes?` | Create account |
 | `outreach_list_sequences` | `name?`, `limit` | Find sequence IDs |
-| `outreach_create_sequence` | `name`, `description?`, `share_type` | Create sequence |
-| `outreach_create_sequence_step` | `sequence_id`, `step_type`, `order?`, `interval_minutes?`, `task_note?` | Add step (incl. task steps) |
-| `outreach_add_prospect_to_sequence` | `sequence_id`, `prospect_id`, `mailbox_id?` | Enroll prospect (sequenceState) |
-| `outreach_create_task` | `prospect_id`, `action`, `note?`, `due_at?`, `owner_id?` | Create one-off task |
-| `outreach_list_mailboxes` | `limit` | Mailbox IDs for enrollment with email steps |
+| `outreach_create_sequence` | `name`, `description?`, `share_type` | Create sequence (created disabled) |
+| `outreach_update_sequence` | `sequence_id`, `name?`, `description?`, `extra_attributes?` | Update writable sequence attributes (`enabled` is not writable) |
+| `outreach_activate_sequence` | `sequence_id` | Enable a sequence (`POST .../actions/activate`) |
+| `outreach_create_sequence_step` | `sequence_id`, `step_type`, `order?`, `interval_seconds?`, `task_note?` | Add step (incl. task steps); interval is in seconds |
+| `outreach_create_template` | `name`, `subject`, `body_html`, `share_type?`, `tags?`, `track_links?`, `track_opens?`, `owner_id?` | Create email template (may contain `{{variables}}`) |
+| `outreach_link_template_to_step` | `sequence_step_id`, `template_id`, `is_reply?`, `activate?` | Attach template to an email step and activate it |
+| `outreach_add_prospect_to_sequence` | `sequence_id`, `prospect_id`, `mailbox_id?` | Enroll prospect (mailbox effectively required) |
+| `outreach_enroll_prospects` | `sequence_id`, `prospect_ids`, `mailbox_id` | Batch enroll up to 100 prospects |
+| `outreach_create_task` | `prospect_id`, `action`, `note?`, `due_at?`, `owner_id?` | Create one-off task (owner effectively required) |
+| `outreach_create_tasks` | `tasks`, `default_owner_id?` | Batch create up to 100 one-off tasks |
+| `outreach_list_mailboxes` | `limit` | Mailbox IDs, required for sequence enrollment |
 | `outreach_list_users` | `email?`, `limit` | User IDs for owner assignment |
 
 ### Typical Fixture Flows
@@ -266,11 +275,40 @@ Salesforce (mirrors `~/scripts/salesforce/setup-account-prospects.ts`):
 Outreach sequence testing:
 
 1. `outreach_create_account` → account ID
-2. `outreach_create_prospect` with `account_id`
+2. `outreach_create_prospect` / `outreach_create_prospects` with `account_id`
 3. `outreach_create_sequence` → sequence ID
 4. `outreach_create_sequence_step` (e.g. `step_type='task'` with `task_note`)
-5. `outreach_add_prospect_to_sequence` (pass `mailbox_id` if the sequence has email steps)
-6. `outreach_create_task` for one-off tasks
+5. `outreach_activate_sequence` (steps don't execute while the sequence is disabled)
+6. `outreach_enroll_prospects` with a `mailbox_id` from `outreach_list_mailboxes`
+7. `outreach_create_task` / `outreach_create_tasks` for one-off tasks
+
+### Migration Fixture Recipe (Nooks SEP migration testing)
+
+Distilled from the Nooks ETL import code (`functions/src/etl-platform/sep-data-import/`)
+and `~/scripts/create-outreach-migration-repro-sequences.ts`:
+
+- **Sequences must be enabled and visible to the workspace admin token.** Migration
+  discovery filters `enabled && (lastUsedAt within 3 months || null)` — disabled
+  sequences are never discovered. Use `share_type='shared'` (private sequences owned by
+  other users are invisible to the admin token) and `outreach_activate_sequence` after
+  adding steps. Fresh fixtures pass the lookback window automatically.
+- **Steps**: `order` is 1-indexed; `interval` is in seconds (Nooks converts to minutes
+  on import). Every Outreach step type maps to a Nooks step type (unknown → BasicTask),
+  so bare definitions never block an import. For variable-resolution testing, use a
+  `manual_email` step with an activated **shared** template whose subject/body contain
+  variables (include non-standard ones like `{{sender_name}}` on purpose).
+- **Definitions-only fixtures are enough** for sequence/step/template/variable migration
+  testing — no prospects or enrollments needed (the SEQ-7244 repro creates none).
+- **Enrollment-stage testing needs more**: sequenceStates in `active`/`paused` state, on
+  prospects whose **primary email matches a Salesforce record already synced into Nooks**
+  (Nooks resolves imported enrollments/tasks against CRM-typed prospects by email, or by
+  Outreach `externalId` = SFDC 18-char ID). Create the matching Salesforce Contact with
+  the salesforce tools first, then the Outreach prospect with the same email. Imported
+  enrollments land paused until migration cutover activates them.
+- **One-off task import candidates** must have: no sequence relationship, `state` =
+  incomplete, `taskType` manual, and a prospect attached. Task owners (and sequence/state
+  owners) map to Nooks users by email — use a real user's `owner_id` from
+  `outreach_list_users`, not an unmapped one.
 
 ## Key Design Patterns
 

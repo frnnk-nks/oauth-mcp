@@ -23,6 +23,8 @@ SCOPES = ["api", "refresh_token"]
 API_VERSION = os.getenv('SALESFORCE_API_VERSION', 'v56.0')
 ERROR_TEXT_CAP = 2000
 REQUEST_TIMEOUT_SECONDS = 30
+COMPOSITE_CHUNK_SIZE = 200  # Salesforce composite sObjects limit per request
+MAX_BATCH_RECORDS = 1000
 
 _IDENTIFIER_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_.]*$')
 _RECORD_ID_RE = re.compile(r'^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$')
@@ -157,6 +159,70 @@ class SalesforceToolApp(OAuthToolApp):
             'id': result['id'],
             'sobject': sobject,
             'url': f"{token.instance_url}/{result['id']}"
+        }
+
+    @tool_scope_factory(scopes=SCOPES)
+    def create_records(
+        self, *,
+        token: SalesforceToken,
+        ctx: Dict[str, Any],
+        records: List[Dict[str, Any]],
+        all_or_none: bool = False
+    ):
+        """
+        Bulk create via the composite sObjects API, chunked at 200 records per request.
+        No whole-method retry — a retry after a partially applied batch would duplicate
+        records; failed chunks are reported per record index instead.
+        """
+        if not records:
+            raise ApiRequestError("records list is empty")
+        if len(records) > MAX_BATCH_RECORDS:
+            raise ApiRequestError(
+                f"batch too large: {len(records)} records > {MAX_BATCH_RECORDS}; split across multiple calls"
+            )
+
+        payloads = []
+        for record in records:
+            sobject = record.get('sobject')
+            fields = record.get('fields') or {}
+            _validate_identifier(sobject, 'object name')
+            for field in fields:
+                _validate_identifier(field, 'field name')
+            payloads.append({'attributes': {'type': sobject}, **fields})
+
+        created, failed = [], []
+        for start in range(0, len(payloads), COMPOSITE_CHUNK_SIZE):
+            chunk = payloads[start:start + COMPOSITE_CHUNK_SIZE]
+            try:
+                results = self._request(
+                    token, 'POST',
+                    f"/services/data/{API_VERSION}/composite/sobjects",
+                    json_body={'allOrNone': all_or_none, 'records': chunk}
+                )
+            except (ApiRequestError, RetryableApiError) as e:
+                failed.extend(
+                    {'index': start + offset, 'errors': [str(e)[:500]]}
+                    for offset in range(len(chunk))
+                )
+                continue
+
+            for offset, result in enumerate(results):
+                index = start + offset
+                if result.get('success'):
+                    created.append({
+                        'index': index,
+                        'id': result['id'],
+                        'sobject': records[index]['sobject']
+                    })
+                else:
+                    failed.append({'index': index, 'errors': result.get('errors', [])})
+
+        return {
+            'requested': len(records),
+            'created_count': len(created),
+            'failed_count': len(failed),
+            'created': created,
+            'failed': failed
         }
 
     @tool_scope_factory(scopes=SCOPES)
