@@ -86,26 +86,92 @@ assistant-mcp/
         └── db.py              # Database utilities (placeholder)
 ```
 
-## Installation
+## Local Setup
+
+Everything below is one-time setup. At the end you'll have a locally running MCP server
+that authenticates to your own Salesforce org and Outreach workspace, with tokens that
+refresh themselves.
+
+### 1. Install dependencies
 
 ```bash
-# Clone the repository
 git clone <repo-url>
 cd assistant-mcp
-
-# Install dependencies with uv
 uv sync
 ```
 
-## Configuration
+### 2. Set up an ngrok tunnel (https origin for OAuth redirects)
 
-Copy `.env.example` to `.env` and fill in the values:
+OAuth providers redirect the browser back to this server after consent. Outreach requires
+that redirect URI to be **https**, so the server needs a public https origin that forwards
+to your local port. ngrok's free tier covers this:
+
+1. Sign up at [dashboard.ngrok.com](https://dashboard.ngrok.com) and install the agent:
+   ```bash
+   brew install ngrok
+   ngrok config add-authtoken <token from dashboard>
+   ```
+2. Claim your **free static domain** (Dashboard → Domains) — one per account, e.g.
+   `your-name-abc123.ngrok-free.dev`. Without it the tunnel URL changes every restart and
+   you'd have to re-edit both provider apps each time.
+3. Run the tunnel, pointed at the server port from `.env`:
+   ```bash
+   ngrok http --url=<your-domain>.ngrok-free.dev 3999
+   ```
+
+Notes:
+- The free tier shows a browser interstitial on first visit — click **Visit Site** during
+  the OAuth flow and everything proceeds normally.
+- The tunnel is only needed **during auth flows** (`/auth/connect` and `/auth/callback` are
+  the only inbound routes). Tool calls and token refreshes are outbound, so you can stop
+  ngrok once tokens are stored.
+- While the tunnel is up, `/mcp` is publicly reachable and uses your stored tokens — keep
+  tunnel sessions short, or gate it with `ngrok http --basic-auth "user:pass" ...`.
+
+### 3. Create your Salesforce app
+
+In your org: **Setup → App Manager → New Connected App** (or an External Client App — both
+work; External Client Apps enforce PKCE, which this server implements):
+
+1. Enable OAuth settings.
+2. **Callback URL**: `https://<your-domain>.ngrok-free.dev/auth/callback`. Optionally also
+   add `http://localhost:3999/auth/callback` — Salesforce allows http for `localhost` only
+   (not `127.0.0.1`), and it lets you auth Salesforce without the tunnel running.
+3. **Selected OAuth Scopes** — exactly two:
+   - Manage user data via APIs (`api`)
+   - Perform requests at any time (`refresh_token`, `offline_access`)
+4. Under policies, leave the refresh token policy at "valid until revoked".
+5. Copy the **Consumer Key** → `SALESFORCE_CLIENT_ID` and **Consumer Secret** →
+   `SALESFORCE_CLIENT_SECRET` (Manage Consumer Details; requires identity verification).
+
+App config changes can take a few minutes to propagate — an immediate `invalid_client_id`
+usually just means "wait and retry".
+
+### 4. Create your Outreach app
+
+At [developers.outreach.io](https://developers.outreach.io) (needs Outreach admin access —
+if you can't create apps, ask an admin):
+
+1. Create a new app and add the **Outreach API (OAuth)** feature. The app can stay
+   private/unlisted; it works for your own org without marketplace publishing.
+2. **Redirect URI**: `https://<your-domain>.ngrok-free.dev/auth/callback` (https mandatory).
+3. Enable exactly the scopes the server requests (see `SCOPES` in
+   `src/mcp_tools/outreach/outreach.py`): `accounts.all`, `prospects.all`, `sequences.all`,
+   `sequenceSteps.all`, `sequenceStates.all`, `tasks.all`, `mailboxes.read`, `users.read`.
+   A missing scope fails the authorize request before any consent screen appears.
+4. Copy the application ID → `OUTREACH_CLIENT_ID` and secret → `OUTREACH_CLIENT_SECRET`.
+
+### 5. Fill out .env
+
+```bash
+cp .env.example .env
+```
 
 | Variable | Description |
 |----------|-------------|
 | `SERVER_HOST` | Server host address (default: 127.0.0.1) |
-| `SERVER_PORT` | Server port number (default: 8000) |
-| `SERVER_ORIGIN_PROXY` | Public https origin for OAuth redirects (e.g. ngrok URL); falls back to `http://SERVER_HOST:SERVER_PORT` |
+| `SERVER_PORT` | Server port number — must match the port ngrok forwards to |
+| `SERVER_ORIGIN_PROXY` | Your tunnel origin, e.g. `https://<your-domain>.ngrok-free.dev` (no trailing slash) |
 | `SALESFORCE_CLIENT_ID` | Connected app consumer key |
 | `SALESFORCE_CLIENT_SECRET` | Connected app consumer secret |
 | `SALESFORCE_LOGIN_HOST` | `https://login.salesforce.com` (prod), `https://test.salesforce.com` (sandbox), or a My Domain URL |
@@ -113,29 +179,43 @@ Copy `.env.example` to `.env` and fill in the values:
 | `SALESFORCE_LOCAL_TOKEN_PATH` | Token storage path (default: ./secrets/salesforce_token.json) |
 | `SALESFORCE_TOKEN_TTL_SECONDS` | Proactive refresh window; Salesforce doesn't report token lifetimes (default: 1800) |
 | `OUTREACH_CLIENT_ID` | Outreach OAuth app client ID |
-| `OUTREACH_CLIENT_SECRET` | Outreach OAuth app client secret |
+| `OUTREACH_CLIENT_SECRET` | Outreach OAuth app client secret (quote it if it contains shell-special characters) |
 | `OUTREACH_OAUTH_BASE_URL` | OAuth endpoint base (default: https://api.outreach.io/oauth) |
 | `OUTREACH_API_BASE_URL` | API base (default: https://api.outreach.io/api/v2) |
 | `OUTREACH_LOCAL_TOKEN_PATH` | Token storage path (default: ./secrets/outreach_token.json) |
 
-### Provider App Setup
+The origin in `SERVER_ORIGIN_PROXY` must match the registered redirect URIs **exactly**,
+character for character — `localhost` vs `127.0.0.1` counts as a mismatch
+(`redirect_uri_mismatch` / "redirect_uri must match configuration").
 
-- **Salesforce**: create a connected app with OAuth enabled, scopes `api` and `refresh_token`
-  (Perform requests at any time), and callback URL `{origin}/auth/callback`. `http://localhost...`
-  callbacks are allowed for local dev; anything else must be https.
-- **Outreach**: create an OAuth app with redirect URI `{origin}/auth/callback` (https required —
-  use `SERVER_ORIGIN_PROXY`) and grant the scopes listed in `src/mcp_tools/outreach/outreach.py`
-  (`accounts.all`, `prospects.all`, `sequences.all`, `sequenceSteps.all`, `sequenceStates.all`,
-  `tasks.all`, `mailboxes.read`, `users.read`). Note: Outreach rotates refresh tokens on every
-  refresh; the token file is rewritten each time.
-
-## Running
+### 6. Run and authenticate
 
 ```bash
 uv run python src/main.py
 ```
 
-The server runs at `http://{SERVER_HOST}:{SERVER_PORT}/mcp` using streamable HTTP transport.
+The server runs at `http://{SERVER_HOST}:{SERVER_PORT}/mcp` (streamable HTTP transport).
+Point an MCP client at it, e.g.:
+
+```bash
+claude mcp add --transport http sf-outreach http://localhost:3999/mcp
+```
+
+Then, with the ngrok tunnel running, call any provider tool (or run
+`uv run python test_client.py`). The first call returns an authorization URL — open it,
+click through the ngrok interstitial, log in, and consent. When you see "You may close
+this tab", the token is stored under `./secrets/` and that provider works from then on:
+tokens refresh proactively, and Outreach's rotating refresh tokens are persisted on every
+refresh. Repeat once per provider.
+
+Troubleshooting:
+- **`.env` edits seem ignored**: `load_dotenv()` never overrides variables already exported
+  in your shell. Check `env | grep -E 'SERVER_|SALESFORCE_|OUTREACH_'` and unset stale
+  values (or launch with the changed var set explicitly).
+- **Force a re-auth / switch orgs or users**: delete the provider's token file under
+  `./secrets/` — the next tool call starts a fresh consent flow.
+- **`missing required code challenge`**: your Salesforce app enforces PKCE; this server
+  sends it (S256) — make sure you're running the current code.
 
 ## MCP Tools
 
