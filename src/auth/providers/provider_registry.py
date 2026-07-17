@@ -4,13 +4,16 @@ Registry for different providers, to support dynamic retrieval of providers.
 Providers should be one-time initialized.
 """
 
-from auth.providers.google_provider import create_google_provider
+from auth.providers.salesforce_provider import create_salesforce_provider
+from auth.providers.outreach_provider import create_outreach_provider
 from auth.providers.provider import OAuthProvider
 
-GOOGLE_PROVIDER = create_google_provider()
+SALESFORCE_PROVIDER = create_salesforce_provider()
+OUTREACH_PROVIDER = create_outreach_provider()
 
 PROVIDER_REGISTRY = {
-    'google': GOOGLE_PROVIDER
+    'salesforce': SALESFORCE_PROVIDER,
+    'outreach': OUTREACH_PROVIDER
 }
 
 def get_provider(provider_name: str) -> OAuthProvider:

@@ -17,18 +17,10 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastmcp>=2.14.2",
-    "gcsa>=2.6.0",
-    "google-api-python-client>=2.187.0",
-    "google-auth-httplib2>=0.3.0",
-    "google-auth-oauthlib>=1.2.3",
     "httpx>=0.28.1",
     "mcp[cli]>=1.25.0",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",
     "typing>=3.10.0.0",
 ]
-
-[project.scripts]
-google-provider = "auth.providers.google_provider:main"
-google-cal = "mcp_tools.google.calendar:main"
 

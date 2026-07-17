@@ -2,6 +2,9 @@
 **/*.txt
 claude.md
 
+# ignore virtual envs
+.venv/
+
 # ignore pycache / other caches
 __pycache__/
 *.py[cod]
@@ -11,6 +14,7 @@ __pycache__/
 .ruff_cache/
 
 
+secrets/
 **/secrets.json
 **/secrets_web.json
 **/token.json
